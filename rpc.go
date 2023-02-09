@@ -82,6 +82,15 @@ type Topic struct {
 	cancel context.CancelFunc
 
 	lk sync.Mutex
+
+	respCh chan response
+}
+
+type response struct {
+	from peer.ID
+	id   cid.Cid
+	data []byte
+	e    error
 }
 
 // NewTopic returns a new topic for the host.
@@ -131,6 +140,8 @@ func newTopic(ctx context.Context, ps *pubsub.PubSub, host peer.ID, topic string
 		ongoing: make(map[cid.Cid]ongoingMessage),
 	}
 	t.ctx, t.cancel = context.WithCancel(ctx)
+	t.respCh = make(chan response)
+	go t.responseWorker()
 
 	go t.watch()
 	if t.s != nil {
@@ -315,6 +326,17 @@ func (t *Topic) listen() {
 	}
 }
 
+func (t *Topic) responseWorker() {
+	for {
+		select {
+		case <-t.ctx.Done():
+			return
+		case resp := <-t.respCh:
+			t.publishResponse(resp.from, resp.id, resp.data, resp.e)
+		}
+	}
+}
+
 func processSubscriptionMessage(handler MessageHandler, from peer.ID, t *Topic, msgData []byte) {
 	res, err := handler(from, t.t.String(), msgData)
 	if err != nil {
@@ -325,7 +347,7 @@ func processSubscriptionMessage(handler MessageHandler, from peer.ID, t *Topic, 
 	if !strings.Contains(t.t.String(), "/_response") {
 		// This is a normal message; respond with data and error
 		msgID := cid.NewCidV1(cid.Raw, util.Hash(msgData))
-		t.publishResponse(from, msgID, res, err)
+		t.respCh <- response{from, msgID, res, err}
 	}
 }
 
