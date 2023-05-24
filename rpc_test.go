@@ -2,26 +2,28 @@ package rpc_test
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
 
-	core "github.com/libp2p/go-libp2p-core/peer"
+	"github.com/libp2p/go-libp2p"
+	pubsub "github.com/libp2p/go-libp2p-pubsub"
+	"github.com/libp2p/go-libp2p/core/host"
+	peer "github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	rpc "github.com/textileio/go-libp2p-pubsub-rpc"
-	"github.com/textileio/go-libp2p-pubsub-rpc/finalizer"
-	"github.com/textileio/go-libp2p-pubsub-rpc/peer"
-	golog "github.com/textileio/go-log/v2"
 	logging "github.com/textileio/go-log/v2"
 	"go.uber.org/zap/zapcore"
+
+	rpc "github.com/sourcenetwork/go-libp2p-pubsub-rpc"
+	"github.com/sourcenetwork/go-libp2p-pubsub-rpc/finalizer"
 )
 
 func init() {
-	if err := setLogLevels(map[string]golog.LogLevel{
-		"psrpc":      golog.LevelDebug,
-		"psrpc/peer": golog.LevelDebug,
-		"psrpc/mdns": golog.LevelDebug,
+	if err := setLogLevels(map[string]logging.LogLevel{
+		"psrpc": logging.LevelDebug,
 	}); err != nil {
 		panic(err)
 	}
@@ -30,29 +32,23 @@ func init() {
 func TestPingPong(t *testing.T) {
 	fin := finalizer.NewFinalizer()
 
-	p1, err := peer.New(peer.Config{
-		RepoPath:   t.TempDir(),
-		EnableMDNS: true,
-	})
+	p1, err := newPeer()
 	require.NoError(t, err)
 	fin.Add(p1)
 
-	p2, err := peer.New(peer.Config{
-		RepoPath:   t.TempDir(),
-		EnableMDNS: true,
-	})
+	p2, err := newPeer()
 	require.NoError(t, err)
 	fin.Add(p2)
 
-	eventHandler := func(from core.ID, topic string, msg []byte) {
+	eventHandler := func(from peer.ID, topic string, msg []byte) {
 		t.Logf("%s event: %s %s", topic, from, msg)
 	}
-	messageHandler := func(from core.ID, topic string, msg []byte) ([]byte, error) { // nolint:unparam
+	messageHandler := func(from peer.ID, topic string, msg []byte) ([]byte, error) { // nolint:unparam
 		t.Logf("%s message: %s %s", topic, from, msg)
 		return []byte("pong"), nil
 	}
 
-	t1, err := p1.NewTopic(context.Background(), "topic", true)
+	t1, err := rpc.NewTopic(context.Background(), p1.ps, p1.ID(), "topic", true)
 	require.NoError(t, err)
 	t1.SetEventHandler(eventHandler)
 	t1.SetMessageHandler(messageHandler)
@@ -74,7 +70,7 @@ func TestPingPong(t *testing.T) {
 	require.NoError(t, r1.Err)
 	assert.Equal(t, "pong", string(r1.Data))
 	assert.NotEmpty(t, r1.ID)
-	assert.Equal(t, p2.Host().ID().String(), r1.From.String())
+	assert.Equal(t, p2.ID().String(), r1.From.String())
 
 	// peer2 requests "pong" from peer1
 	rc2, err := t2.Publish(context.Background(), []byte("ping"))
@@ -84,7 +80,7 @@ func TestPingPong(t *testing.T) {
 	require.NoError(t, r2.Err)
 	assert.Equal(t, "pong", string(r2.Data))
 	assert.NotEmpty(t, r2.ID)
-	assert.Equal(t, p1.Host().ID().String(), r2.From.String())
+	assert.Equal(t, p1.ID().String(), r2.From.String())
 
 	// test ignore response - make sure nothing weird happens.
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -128,31 +124,22 @@ func TestPingPong(t *testing.T) {
 func TestMultiPingPong(t *testing.T) {
 	fin := finalizer.NewFinalizer()
 
-	p1, err := peer.New(peer.Config{
-		RepoPath:   t.TempDir(),
-		EnableMDNS: true,
-	})
+	p1, err := newPeer()
 	require.NoError(t, err)
 	fin.Add(p1)
 
-	p2, err := peer.New(peer.Config{
-		RepoPath:   t.TempDir(),
-		EnableMDNS: true,
-	})
+	p2, err := newPeer()
 	require.NoError(t, err)
 	fin.Add(p2)
 
-	p3, err := peer.New(peer.Config{
-		RepoPath:   t.TempDir(),
-		EnableMDNS: true,
-	})
+	p3, err := newPeer()
 	require.NoError(t, err)
 	fin.Add(p3)
 
-	eventHandler := func(from core.ID, topic string, msg []byte) {
+	eventHandler := func(from peer.ID, topic string, msg []byte) {
 		t.Logf("%s event: %s %s", topic, from, msg)
 	}
-	messageHandler := func(from core.ID, topic string, msg []byte) ([]byte, error) { // nolint:unparam
+	messageHandler := func(from peer.ID, topic string, msg []byte) ([]byte, error) { // nolint:unparam
 		t.Logf("%s message: %s %s", topic, from, msg)
 		return []byte("pong"), nil
 	}
@@ -259,4 +246,66 @@ func setLogLevels(systems map[string]logging.LogLevel) error {
 		}
 	}
 	return nil
+}
+
+// DiscoveryServiceTag is used in our mDNS advertisements to discover other chat peers.
+const DiscoveryServiceTag = "pubsub-chat-example"
+
+// discoveryNotifee gets notified when we find a new peer via mDNS discovery
+type discoveryNotifee struct {
+	h host.Host
+}
+
+// HandlePeerFound connects to peers discovered via mDNS. Once they're connected,
+// the PubSub system will automatically start interacting with them if they also
+// support PubSub.
+func (n *discoveryNotifee) HandlePeerFound(pi peer.AddrInfo) {
+	fmt.Printf("discovered new peer %s\n", pi.ID.Pretty())
+	err := n.h.Connect(context.Background(), pi)
+	if err != nil {
+		fmt.Printf("error connecting to peer %s: %s\n", pi.ID.Pretty(), err)
+	}
+}
+
+// setupDiscovery creates an mDNS discovery service and attaches it to the libp2p Host.
+// This lets us automatically discover peers on the same LAN and connect to them.
+func setupDiscovery(h host.Host) error {
+	// setup mDNS discovery to find local peers
+	s := mdns.NewMdnsService(h, DiscoveryServiceTag, &discoveryNotifee{h: h})
+	return s.Start()
+}
+
+type lp2ppeer struct {
+	ps *pubsub.PubSub
+	host.Host
+}
+
+func newPeer() (*lp2ppeer, error) {
+	ctx := context.Background()
+
+	// create a new libp2p Host that listens on a random TCP port
+	h, err := libp2p.New(libp2p.ListenAddrStrings("/ip4/0.0.0.0/tcp/0"))
+	if err != nil {
+		panic(err)
+	}
+
+	// create a new PubSub service using the GossipSub router
+	ps, err := pubsub.NewGossipSub(ctx, h)
+	if err != nil {
+		panic(err)
+	}
+
+	// setup local mDNS discovery
+	if err := setupDiscovery(h); err != nil {
+		panic(err)
+	}
+
+	return &lp2ppeer{
+		ps:   ps,
+		Host: h,
+	}, nil
+}
+
+func (p *lp2ppeer) NewTopic(ctx context.Context, topic string, subscribe bool) (*rpc.Topic, error) {
+	return rpc.NewTopic(ctx, p.ps, p.ID(), topic, subscribe)
 }
