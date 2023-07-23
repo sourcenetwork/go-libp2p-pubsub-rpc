@@ -332,7 +332,7 @@ func (t *Topic) responseWorker() {
 		case <-t.ctx.Done():
 			return
 		case resp := <-t.respCh:
-			t.publishResponse(resp.from, resp.id, resp.data, resp.e)
+			t.PublishResponse(resp.from, resp.id, resp.data, resp.e)
 		}
 	}
 }
@@ -351,7 +351,7 @@ func processSubscriptionMessage(handler MessageHandler, from peer.ID, t *Topic, 
 	}
 }
 
-func (t *Topic) publishResponse(from peer.ID, id cid.Cid, data []byte, e error) {
+func (t *Topic) PublishResponse(from peer.ID, id cid.Cid, data []byte, e error) {
 	topic, err := newTopic(t.ctx, t.ps, t.host, responseTopic(t.t.String(), from), false)
 	if err != nil {
 		log.Errorf("creating response topic: %v", err)
