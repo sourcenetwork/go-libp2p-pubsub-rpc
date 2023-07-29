@@ -140,7 +140,7 @@ func newTopic(ctx context.Context, ps *pubsub.PubSub, host peer.ID, topic string
 		ongoing: make(map[cid.Cid]ongoingMessage),
 	}
 	t.ctx, t.cancel = context.WithCancel(ctx)
-	t.respCh = make(chan response)
+	t.respCh = make(chan response, 100)
 	go t.responseWorker()
 
 	go t.watch()
@@ -307,12 +307,16 @@ func (t *Topic) republishTo(p peer.ID) {
 }
 
 func (t *Topic) listen() {
+
 	for {
+		log.Debugf("looping on topic (%s) subscription listener...", t.t.String())
 		msg, err := t.s.Next(t.ctx)
 		if err != nil {
+			log.Errorf("failed to get next topic (%s) subscription event: %s", t.t.String(), err)
 			break
 		}
 		if msg.ReceivedFrom.String() == t.host.String() {
+			log.Debugf("skipping pubsub subscription message from ourself  (%s)", t.t.String())
 			continue
 		}
 		t.lk.Lock()
@@ -322,8 +326,10 @@ func (t *Topic) listen() {
 			log.Warnf("didn't process topic message since we don't have a handler")
 			continue
 		}
+		log.Debugf("processing pubsub subscription message from %s on topic %s", msg.ReceivedFrom, t.t.String())
 		go processSubscriptionMessage(handler, msg.ReceivedFrom, t, msg.Data)
 	}
+	log.Errorf("exiting topic %s listen loop", t.t.String())
 }
 
 func (t *Topic) responseWorker() {
