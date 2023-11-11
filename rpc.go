@@ -1,6 +1,7 @@
 package rpc
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -8,11 +9,13 @@ import (
 	"strings"
 	"sync"
 
+	util "github.com/ipfs/boxo/util"
 	"github.com/ipfs/go-cid"
-	util "github.com/ipfs/go-ipfs-util"
-	cbor "github.com/ipfs/go-ipld-cbor"
-	"github.com/libp2p/go-libp2p-core/peer"
+	cbor "github.com/ipld/go-ipld-prime/codec/dagcbor"
+	"github.com/ipld/go-ipld-prime/node/basicnode"
+	"github.com/ipld/go-ipld-prime/node/bindnode"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
+	"github.com/libp2p/go-libp2p/core/peer"
 	golog "github.com/textileio/go-log/v2"
 )
 
@@ -46,10 +49,6 @@ type internalResponse struct {
 	From []byte
 	Data []byte
 	Err  string
-}
-
-func init() {
-	cbor.RegisterCborType(internalResponse{})
 }
 
 func responseTopic(base string, pid peer.ID) string {
@@ -372,13 +371,15 @@ func (t *Topic) publishResponse(from peer.ID, id cid.Cid, data []byte, e error) 
 	if e != nil {
 		res.Err = e.Error()
 	}
-	msg, err := cbor.DumpObject(&res)
+	node := bindnode.Wrap(&res, nil)
+	buf := bytes.Buffer{}
+	err = cbor.Encode(node.Representation(), &buf)
 	if err != nil {
 		log.Errorf("encoding response: %v", err)
 		return
 	}
 
-	if err := topic.t.Publish(t.ctx, msg); err != nil {
+	if err := topic.t.Publish(t.ctx, buf.Bytes()); err != nil {
 		log.Errorf("publishing response: %v", err)
 	}
 }
@@ -388,14 +389,18 @@ func (t *Topic) resEventHandler(from peer.ID, topic string, msg []byte) {
 }
 
 func (t *Topic) resMessageHandler(from peer.ID, topic string, msg []byte) ([]byte, error) {
-	var res internalResponse
-	if err := cbor.DecodeInto(msg, &res); err != nil {
+	nb := basicnode.Prototype.Any.NewBuilder()
+
+	cbor.Decode(nb, strings.NewReader(string(msg)))
+	if err := cbor.Decode(nb, strings.NewReader(string(msg))); err != nil {
 		return nil, fmt.Errorf("decoding response: %v", err)
 	}
+	res := bindnode.Unwrap(nb.Build()).(internalResponse)
 	id, err := cid.Decode(res.ID)
 	if err != nil {
 		return nil, fmt.Errorf("decoding response id: %v", err)
 	}
+
 	res.From = []byte(from)
 
 	log.Debugf("%s response from %s: %s", topic, from, res.ID)
