@@ -11,8 +11,9 @@ import (
 
 	util "github.com/ipfs/boxo/util"
 	"github.com/ipfs/go-cid"
+	"github.com/ipld/go-ipld-prime"
+	"github.com/ipld/go-ipld-prime/codec/dagcbor"
 	cbor "github.com/ipld/go-ipld-prime/codec/dagcbor"
-	"github.com/ipld/go-ipld-prime/node/basicnode"
 	"github.com/ipld/go-ipld-prime/node/bindnode"
 	"github.com/ipld/go-ipld-prime/schema"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
@@ -395,13 +396,11 @@ func (t *Topic) resEventHandler(from peer.ID, topic string, msg []byte) {
 }
 
 func (t *Topic) resMessageHandler(from peer.ID, topic string, msg []byte) ([]byte, error) {
-	nb := basicnode.Prototype.Any.NewBuilder()
-
-	cbor.Decode(nb, strings.NewReader(string(msg)))
-	if err := cbor.Decode(nb, strings.NewReader(string(msg))); err != nil {
+	node, err := ipld.DecodeUsingPrototype(msg, dagcbor.Decode, resType.Prototype())
+	if err != nil {
 		return nil, fmt.Errorf("decoding response: %v", err)
 	}
-	res := bindnode.Unwrap(nb.Build()).(internalResponse)
+	res := bindnode.Unwrap(node).(*internalResponse)
 	id, err := cid.Decode(res.ID)
 	if err != nil {
 		return nil, fmt.Errorf("decoding response id: %v", err)
@@ -415,7 +414,7 @@ func (t *Topic) resMessageHandler(from peer.ID, topic string, msg []byte) ([]byt
 	t.lk.Unlock()
 	if exists {
 		if m.respCh != nil {
-			m.respCh <- res
+			m.respCh <- *res
 		}
 	} else {
 		log.Debugf("%s response from %s arrives too late, discarding", topic, from)
