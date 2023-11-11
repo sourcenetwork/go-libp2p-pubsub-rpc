@@ -14,6 +14,7 @@ import (
 	cbor "github.com/ipld/go-ipld-prime/codec/dagcbor"
 	"github.com/ipld/go-ipld-prime/node/basicnode"
 	"github.com/ipld/go-ipld-prime/node/bindnode"
+	"github.com/ipld/go-ipld-prime/schema"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/peer"
 	golog "github.com/textileio/go-log/v2"
@@ -49,6 +50,12 @@ type internalResponse struct {
 	From []byte
 	Data []byte
 	Err  string
+}
+
+var resType schema.TypedNode
+
+func init() {
+	resType = bindnode.Wrap(&internalResponse{}, nil)
 }
 
 func responseTopic(base string, pid peer.ID) string {
@@ -371,9 +378,8 @@ func (t *Topic) publishResponse(from peer.ID, id cid.Cid, data []byte, e error) 
 	if e != nil {
 		res.Err = e.Error()
 	}
-	node := bindnode.Wrap(&res, nil)
 	buf := bytes.Buffer{}
-	err = cbor.Encode(node.Representation(), &buf)
+	err = cbor.Encode(resType.Representation(), &buf)
 	if err != nil {
 		log.Errorf("encoding response: %v", err)
 		return
