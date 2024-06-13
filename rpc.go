@@ -1,7 +1,6 @@
 package rpc
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -13,8 +12,6 @@ import (
 	"github.com/ipfs/go-cid"
 	"github.com/ipld/go-ipld-prime"
 	"github.com/ipld/go-ipld-prime/codec/dagcbor"
-	cbor "github.com/ipld/go-ipld-prime/codec/dagcbor"
-	"github.com/ipld/go-ipld-prime/node/bindnode"
 	"github.com/ipld/go-ipld-prime/schema"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -53,10 +50,20 @@ type internalResponse struct {
 	Err  string
 }
 
-var resType schema.TypedNode
+var resType schema.Type
 
 func init() {
-	resType = bindnode.Wrap(&internalResponse{}, nil)
+	ts, err := ipld.LoadSchemaBytes([]byte(`
+	type internalResponse struct {
+		ID String
+		From Bytes
+		Data Bytes
+		Err String
+	}`))
+	if err != nil {
+		panic(err)
+	}
+	resType = ts.TypeByName("internalResponse")
 }
 
 func responseTopic(base string, pid peer.ID) string {
@@ -379,14 +386,13 @@ func (t *Topic) publishResponse(from peer.ID, id cid.Cid, data []byte, e error) 
 	if e != nil {
 		res.Err = e.Error()
 	}
-	buf := bytes.Buffer{}
-	err = cbor.Encode(resType.Representation(), &buf)
+	b, err := ipld.Marshal(dagcbor.Encode, &res, resType)
 	if err != nil {
 		log.Errorf("encoding response: %v", err)
 		return
 	}
 
-	if err := topic.t.Publish(t.ctx, buf.Bytes()); err != nil {
+	if err := topic.t.Publish(t.ctx, b); err != nil {
 		log.Errorf("publishing response: %v", err)
 	}
 }
@@ -396,11 +402,11 @@ func (t *Topic) resEventHandler(from peer.ID, topic string, msg []byte) {
 }
 
 func (t *Topic) resMessageHandler(from peer.ID, topic string, msg []byte) ([]byte, error) {
-	node, err := ipld.DecodeUsingPrototype(msg, dagcbor.Decode, resType.Prototype())
+	res := internalResponse{}
+	_, err := ipld.Unmarshal(msg, dagcbor.Decode, &res, resType)
 	if err != nil {
 		return nil, fmt.Errorf("decoding response: %v", err)
 	}
-	res := bindnode.Unwrap(node).(*internalResponse)
 	id, err := cid.Decode(res.ID)
 	if err != nil {
 		return nil, fmt.Errorf("decoding response id: %v", err)
@@ -414,7 +420,7 @@ func (t *Topic) resMessageHandler(from peer.ID, topic string, msg []byte) ([]byt
 	t.lk.Unlock()
 	if exists {
 		if m.respCh != nil {
-			m.respCh <- *res
+			m.respCh <- res
 		}
 	} else {
 		log.Debugf("%s response from %s arrives too late, discarding", topic, from)
