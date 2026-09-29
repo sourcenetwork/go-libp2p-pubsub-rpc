@@ -420,7 +420,13 @@ func (t *Topic) resMessageHandler(from peer.ID, topic string, msg []byte) ([]byt
 	t.lk.Unlock()
 	if exists {
 		if m.respCh != nil {
-			m.respCh <- res
+			// The request may end while we wait for it to read the response. Without
+			// these cases, this goroutine would block forever.
+			select {
+			case m.respCh <- res:
+			case <-m.ctx.Done():
+			case <-t.ctx.Done():
+			}
 		}
 	} else {
 		log.Debugf("%s response from %s arrives too late, discarding", topic, from)
