@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"path"
+	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	util "github.com/ipfs/boxo/util"
 	"github.com/ipfs/go-cid"
@@ -287,11 +289,7 @@ func (t *Topic) watch() {
 		switch e.Type {
 		case pubsub.PeerJoin:
 			msg = "JOINED"
-			// Note: it looks like we are publishing to this
-			// specific peer, but the rpc library doesn't have the
-			// ability, so it actually does is to republish to all
-			// peers.
-			t.republishTo(e.Peer)
+			go t.republishWhenReachable(e.Peer)
 		case pubsub.PeerLeave:
 			msg = "LEFT"
 		default:
@@ -305,6 +303,34 @@ func (t *Topic) watch() {
 	}
 }
 
+// reachableTimeout bounds how long a joined peer is waited for before the
+// resend goes out anyway.
+const reachableTimeout = 5 * time.Second
+
+// republishWhenReachable resends ongoing messages once this node can send to
+// the joined peer. Without the wait, a resend right after a peer joins can be
+// lost, and so can a message published just before, since no later join
+// triggers another resend.
+func (t *Topic) republishWhenReachable(p peer.ID) {
+	timeout := time.NewTimer(reachableTimeout)
+	defer timeout.Stop()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for !slices.Contains(t.ps.ListPeers(t.t.String()), p) {
+		select {
+		case <-ticker.C:
+		case <-timeout.C:
+			t.republishTo(p)
+			return
+		case <-t.ctx.Done():
+			return
+		}
+	}
+	t.republishTo(p)
+}
+
+// republishTo resends ongoing messages after peer p joins. The rpc library
+// can't publish to a single peer, so this republishes to all peers.
 func (t *Topic) republishTo(p peer.ID) {
 	t.lk.Lock()
 	for _, m := range t.ongoing {
