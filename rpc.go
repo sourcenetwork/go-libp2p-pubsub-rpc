@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"path"
-	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -87,7 +86,9 @@ type Topic struct {
 	eventHandler   EventHandler
 	messageHandler MessageHandler
 
-	ongoing  map[cid.Cid]ongoingMessage
+	ongoing map[cid.Cid]ongoingMessage
+	// waiting holds the joined peers a resend is waiting to reach.
+	waiting  map[peer.ID]struct{}
 	resTopic *Topic
 
 	t *pubsub.Topic
@@ -154,6 +155,7 @@ func newTopic(ctx context.Context, ps *pubsub.PubSub, host peer.ID, topic string
 		h:       handler,
 		s:       sub,
 		ongoing: make(map[cid.Cid]ongoingMessage),
+		waiting: make(map[peer.ID]struct{}),
 	}
 	t.ctx, t.cancel = context.WithCancel(ctx)
 	t.respCh = make(chan response)
@@ -289,7 +291,7 @@ func (t *Topic) watch() {
 		switch e.Type {
 		case pubsub.PeerJoin:
 			msg = "JOINED"
-			go t.republishWhenReachable(e.Peer)
+			t.republishOnJoin(e.Peer)
 		case pubsub.PeerLeave:
 			msg = "LEFT"
 		default:
@@ -307,16 +309,47 @@ func (t *Topic) watch() {
 // resend goes out anyway.
 const reachableTimeout = 5 * time.Second
 
+// republishOnJoin resends ongoing messages to a joined peer once it can receive
+// them. Without the wait, a message sent around the join can be lost.
+// At most one goroutine waits per peer.
+func (t *Topic) republishOnJoin(p peer.ID) {
+	if t.canSendTo(p) {
+		t.republishTo(p)
+		return
+	}
+	t.lk.Lock()
+	if _, ok := t.waiting[p]; ok {
+		t.lk.Unlock()
+		return
+	}
+	t.waiting[p] = struct{}{}
+	t.lk.Unlock()
+	go t.republishWhenReachable(p)
+}
+
+// canSendTo reports whether this node can send to peer p on the topic.
+func (t *Topic) canSendTo(p peer.ID) bool {
+	for _, id := range t.ps.ListPeers(t.t.String()) {
+		if id == p {
+			return true
+		}
+	}
+	return false
+}
+
 // republishWhenReachable resends ongoing messages once this node can send to
-// the joined peer. Without the wait, a resend right after a peer joins can be
-// lost, and so can a message published just before, since no later join
-// triggers another resend.
+// peer p, or after reachableTimeout.
 func (t *Topic) republishWhenReachable(p peer.ID) {
+	defer func() {
+		t.lk.Lock()
+		delete(t.waiting, p)
+		t.lk.Unlock()
+	}()
 	timeout := time.NewTimer(reachableTimeout)
 	defer timeout.Stop()
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
-	for !slices.Contains(t.ps.ListPeers(t.t.String()), p) {
+	for !t.canSendTo(p) {
 		select {
 		case <-ticker.C:
 		case <-timeout.C:

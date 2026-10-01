@@ -2,7 +2,6 @@ package rpc_test
 
 import (
 	"context"
-	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -78,7 +77,7 @@ func TestPublish_PeerJoinedButNotYetReachable_GetsRequest(t *testing.T) {
 			// Let any send attempt made while unreachable happen, then make
 			// the responder reachable.
 			time.Sleep(200 * time.Millisecond)
-			require.False(t, slices.Contains(askerPS.ListPeers("topic"), responder.ID()),
+			require.NotContains(t, askerPS.ListPeers("topic"), responder.ID(),
 				"the gate no longer holds back sending; pubsub likely changed how it starts sending to a new peer")
 			close(release)
 
