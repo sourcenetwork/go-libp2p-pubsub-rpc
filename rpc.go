@@ -7,6 +7,7 @@ import (
 	"path"
 	"strings"
 	"sync"
+	"time"
 
 	util "github.com/ipfs/boxo/util"
 	"github.com/ipfs/go-cid"
@@ -85,7 +86,9 @@ type Topic struct {
 	eventHandler   EventHandler
 	messageHandler MessageHandler
 
-	ongoing  map[cid.Cid]ongoingMessage
+	ongoing map[cid.Cid]ongoingMessage
+	// waiting holds the joined peers a resend is waiting to reach.
+	waiting  map[peer.ID]struct{}
 	resTopic *Topic
 
 	t *pubsub.Topic
@@ -152,6 +155,7 @@ func newTopic(ctx context.Context, ps *pubsub.PubSub, host peer.ID, topic string
 		h:       handler,
 		s:       sub,
 		ongoing: make(map[cid.Cid]ongoingMessage),
+		waiting: make(map[peer.ID]struct{}),
 	}
 	t.ctx, t.cancel = context.WithCancel(ctx)
 	t.respCh = make(chan response)
@@ -287,11 +291,7 @@ func (t *Topic) watch() {
 		switch e.Type {
 		case pubsub.PeerJoin:
 			msg = "JOINED"
-			// Note: it looks like we are publishing to this
-			// specific peer, but the rpc library doesn't have the
-			// ability, so it actually does is to republish to all
-			// peers.
-			t.republishTo(e.Peer)
+			t.republishOnJoin(e.Peer)
 		case pubsub.PeerLeave:
 			msg = "LEFT"
 		default:
@@ -305,6 +305,63 @@ func (t *Topic) watch() {
 	}
 }
 
+// reachableTimeout bounds how long a joined peer is waited for.
+const reachableTimeout = 5 * time.Second
+
+// republishOnJoin resends ongoing messages to a joined peer once it can receive
+// them. Without the wait, a message sent around the join can be lost.
+// At most one goroutine waits per peer.
+func (t *Topic) republishOnJoin(p peer.ID) {
+	if t.canSendTo(p) {
+		t.republishTo(p)
+		return
+	}
+	t.lk.Lock()
+	if _, ok := t.waiting[p]; ok {
+		t.lk.Unlock()
+		return
+	}
+	t.waiting[p] = struct{}{}
+	t.lk.Unlock()
+	go t.republishWhenReachable(p)
+}
+
+// canSendTo reports whether this node can send to peer p on the topic.
+func (t *Topic) canSendTo(p peer.ID) bool {
+	for _, id := range t.ps.ListPeers(t.t.String()) {
+		if id == p {
+			return true
+		}
+	}
+	return false
+}
+
+// republishWhenReachable resends ongoing messages once this node can send to
+// peer p. It gives up after reachableTimeout, since a resend can't reach p.
+func (t *Topic) republishWhenReachable(p peer.ID) {
+	defer func() {
+		t.lk.Lock()
+		delete(t.waiting, p)
+		t.lk.Unlock()
+	}()
+	timeout := time.NewTimer(reachableTimeout)
+	defer timeout.Stop()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for !t.canSendTo(p) {
+		select {
+		case <-ticker.C:
+		case <-timeout.C:
+			return
+		case <-t.ctx.Done():
+			return
+		}
+	}
+	t.republishTo(p)
+}
+
+// republishTo resends ongoing messages after peer p joins. The rpc library
+// can't publish to a single peer, so this republishes to all peers.
 func (t *Topic) republishTo(p peer.ID) {
 	t.lk.Lock()
 	for _, m := range t.ongoing {
