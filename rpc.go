@@ -305,8 +305,7 @@ func (t *Topic) watch() {
 	}
 }
 
-// reachableTimeout bounds how long a joined peer is waited for before the
-// resend goes out anyway.
+// reachableTimeout bounds how long a joined peer is waited for.
 const reachableTimeout = 5 * time.Second
 
 // republishOnJoin resends ongoing messages to a joined peer once it can receive
@@ -338,7 +337,7 @@ func (t *Topic) canSendTo(p peer.ID) bool {
 }
 
 // republishWhenReachable resends ongoing messages once this node can send to
-// peer p, or after reachableTimeout.
+// peer p. It gives up after reachableTimeout, since a resend can't reach p.
 func (t *Topic) republishWhenReachable(p peer.ID) {
 	defer func() {
 		t.lk.Lock()
@@ -353,7 +352,6 @@ func (t *Topic) republishWhenReachable(p peer.ID) {
 		select {
 		case <-ticker.C:
 		case <-timeout.C:
-			t.republishTo(p)
 			return
 		case <-t.ctx.Done():
 			return
