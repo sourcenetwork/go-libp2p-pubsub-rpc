@@ -87,8 +87,9 @@ type Topic struct {
 	messageHandler MessageHandler
 
 	ongoing map[cid.Cid]ongoingMessage
-	// waiting holds the joined peers a resend is waiting to reach.
-	waiting  map[peer.ID]struct{}
+	// waiting holds the joined peers a resend is waiting to reach, with the
+	// time to give up on each.
+	waiting  map[peer.ID]time.Time
 	resTopic *Topic
 
 	t *pubsub.Topic
@@ -155,7 +156,7 @@ func newTopic(ctx context.Context, ps *pubsub.PubSub, host peer.ID, topic string
 		h:       handler,
 		s:       sub,
 		ongoing: make(map[cid.Cid]ongoingMessage),
-		waiting: make(map[peer.ID]struct{}),
+		waiting: make(map[peer.ID]time.Time),
 	}
 	t.ctx, t.cancel = context.WithCancel(ctx)
 	t.respCh = make(chan response)
@@ -310,20 +311,19 @@ const reachableTimeout = 5 * time.Second
 
 // republishOnJoin resends ongoing messages to a joined peer once it can receive
 // them. Without the wait, a message sent around the join can be lost.
-// At most one goroutine waits per peer.
 func (t *Topic) republishOnJoin(p peer.ID) {
 	if t.canSendTo(p) {
 		t.republishTo(p)
 		return
 	}
 	t.lk.Lock()
-	if _, ok := t.waiting[p]; ok {
-		t.lk.Unlock()
-		return
-	}
-	t.waiting[p] = struct{}{}
+	start := len(t.waiting) == 0
+	t.waiting[p] = time.Now().Add(reachableTimeout)
 	t.lk.Unlock()
-	go t.republishWhenReachable(p)
+	// One goroutine serves every waiting peer, and exits once none are left.
+	if start {
+		go t.republishWhenReachable()
+	}
 }
 
 // canSendTo reports whether this node can send to peer p on the topic.
@@ -336,38 +336,54 @@ func (t *Topic) canSendTo(p peer.ID) bool {
 	return false
 }
 
-// republishWhenReachable resends ongoing messages once this node can send to
-// peer p. It gives up after reachableTimeout, since a resend can't reach p.
-func (t *Topic) republishWhenReachable(p peer.ID) {
-	defer func() {
-		t.lk.Lock()
-		delete(t.waiting, p)
-		t.lk.Unlock()
-	}()
-	timeout := time.NewTimer(reachableTimeout)
-	defer timeout.Stop()
+// republishWhenReachable resends ongoing messages as waiting peers become
+// reachable. A peer still unreachable after reachableTimeout is dropped, since
+// a resend can't reach it.
+func (t *Topic) republishWhenReachable() {
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
-	for !t.canSendTo(p) {
+	for {
 		select {
 		case <-ticker.C:
-		case <-timeout.C:
-			return
 		case <-t.ctx.Done():
 			return
 		}
+
+		reachable := make(map[peer.ID]struct{})
+		for _, id := range t.ps.ListPeers(t.t.String()) {
+			reachable[id] = struct{}{}
+		}
+		now := time.Now()
+		var ready []peer.ID
+		t.lk.Lock()
+		for p, deadline := range t.waiting {
+			if _, ok := reachable[p]; ok {
+				ready = append(ready, p)
+				delete(t.waiting, p)
+			} else if now.After(deadline) {
+				delete(t.waiting, p)
+			}
+		}
+		done := len(t.waiting) == 0
+		t.lk.Unlock()
+
+		if len(ready) > 0 {
+			t.republishTo(ready...)
+		}
+		if done {
+			return
+		}
 	}
-	t.republishTo(p)
 }
 
-// republishTo resends ongoing messages after peer p joins. The rpc library
-// can't publish to a single peer, so this republishes to all peers.
-func (t *Topic) republishTo(p peer.ID) {
+// republishTo resends ongoing messages after the given peers join. The rpc
+// library can't publish to single peers, so this republishes to all peers.
+func (t *Topic) republishTo(peers ...peer.ID) {
 	t.lk.Lock()
 	for _, m := range t.ongoing {
 		if m.republish {
 			go func(m ongoingMessage) {
-				log.Debugf("republishing %s because peer %s newly joins", t.t, p)
+				log.Debugf("republishing %s because peers %v newly join", t.t, peers)
 				if err := t.t.Publish(m.ctx, m.data, m.opts...); err != nil {
 					log.Errorf("republishing to topic: %v", err)
 				}

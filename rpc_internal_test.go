@@ -2,6 +2,7 @@ package rpc
 
 import (
 	"context"
+	"runtime"
 	"testing"
 	"time"
 
@@ -9,7 +10,10 @@ import (
 	"github.com/ipfs/go-cid"
 	"github.com/ipld/go-ipld-prime"
 	"github.com/ipld/go-ipld-prime/codec/dagcbor"
+	"github.com/libp2p/go-libp2p"
+	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/test"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -78,6 +82,32 @@ func TestResMessageHandler_Reading_DeliversResponse(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("response was not delivered")
 	}
+}
+
+// Many peers waiting to become reachable share one goroutine, which exits once
+// they are all dropped.
+func TestRepublishOnJoin_ManyUnreachablePeers_OneWaiter(t *testing.T) {
+	h, err := libp2p.New(libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"))
+	require.NoError(t, err)
+	defer func() { _ = h.Close() }()
+	ps, err := pubsub.NewGossipSub(context.Background(), h)
+	require.NoError(t, err)
+	topic, err := NewTopic(context.Background(), ps, h.ID(), "topic", true)
+	require.NoError(t, err)
+	defer func() { _ = topic.Close() }()
+
+	before := runtime.NumGoroutine()
+	// These peers never connect, so none of them becomes reachable.
+	for i := 0; i < 100; i++ {
+		topic.republishOnJoin(test.RandPeerIDFatal(t))
+	}
+	assert.LessOrEqual(t, runtime.NumGoroutine(), before+1)
+
+	require.Eventually(t, func() bool {
+		topic.lk.Lock()
+		defer topic.lk.Unlock()
+		return len(topic.waiting) == 0
+	}, reachableTimeout+time.Second, 50*time.Millisecond)
 }
 
 // newTopicWithOngoing returns a topic with one ongoing request that reports
