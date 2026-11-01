@@ -409,7 +409,12 @@ func (t *Topic) listen() {
 			log.Warnf("didn't process topic message since we don't have a handler")
 			continue
 		}
-		go processSubscriptionMessage(handler, msg.ReceivedFrom, t, msg.Data)
+		// ReceivedFrom is the forwarding peer when the message was relayed, so respond to the author.
+		author := msg.GetFrom()
+		if author == "" { // published without an author
+			author = msg.ReceivedFrom
+		}
+		go processSubscriptionMessage(handler, msg.ReceivedFrom, author, t, msg.Data)
 	}
 }
 
@@ -424,7 +429,7 @@ func (t *Topic) responseWorker() {
 	}
 }
 
-func processSubscriptionMessage(handler MessageHandler, from peer.ID, t *Topic, msgData []byte) {
+func processSubscriptionMessage(handler MessageHandler, from, author peer.ID, t *Topic, msgData []byte) {
 	res, err := handler(from, t.t.String(), msgData)
 	if err != nil {
 		log.Errorf("subcription message handler: %v", err)
@@ -434,7 +439,7 @@ func processSubscriptionMessage(handler MessageHandler, from peer.ID, t *Topic, 
 	if !strings.Contains(t.t.String(), "/_response") {
 		// This is a normal message; respond with data and error
 		msgID := cid.NewCidV1(cid.Raw, util.Hash(msgData))
-		t.respCh <- response{from, msgID, res, err}
+		t.respCh <- response{author, msgID, res, err}
 	}
 }
 
